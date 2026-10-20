@@ -1,0 +1,1 @@
+- [TikTok-only scope](tiktok-only-scope.md) — цей бот має стежити лише за TikTok, без моніторингу YouTube.

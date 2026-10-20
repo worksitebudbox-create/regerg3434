@@ -1,0 +1,17 @@
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+.git
+.venv
+**/.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+node_modules
+**/node_modules
+artifacts
+lib
+scripts
+telegram_video_bot/data
