@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from collections.abc import Iterable
 from html import escape
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -32,6 +34,20 @@ from .tiktok import (
 logger = logging.getLogger("tiktok_monitor")
 TELEGRAM_CAPTION_LIMIT = 1024
 HEARTBEAT_INTERVAL_SECONDS = 300
+
+
+async def _health_check(request: web.Request) -> web.Response:
+    return web.Response(
+        text="ok\n",
+        headers={"X-Health-Check": request.path},
+    )
+
+
+def _create_health_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", _health_check)
+    app.router.add_get("/health", _health_check)
+    return app
 
 
 def _utf16_length(value: str) -> int:
@@ -620,7 +636,15 @@ async def main() -> None:
     dispatcher.startup.register(start_monitor)
     dispatcher.shutdown.register(stop_monitor)
 
+    port = int(os.getenv("PORT", "8080"))
+    if not 1 <= port <= 65535:
+        raise ValueError("PORT має бути числом від 1 до 65535.")
+    web_runner = web.AppRunner(_create_health_app())
+
     try:
+        await web_runner.setup()
+        await web.TCPSite(web_runner, "0.0.0.0", port).start()
+        logger.info("Health endpoint listening on port %s", port)
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Відкрити головне меню"),
@@ -633,8 +657,13 @@ async def main() -> None:
         )
         await dispatcher.start_polling(bot)
     finally:
-        await database.close()
-        await bot.session.close()
+        try:
+            await web_runner.cleanup()
+        finally:
+            try:
+                await database.close()
+            finally:
+                await bot.session.close()
 
 
 if __name__ == "__main__":

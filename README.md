@@ -26,6 +26,9 @@ by default. Admins must send `/start` before the bot can message them.
 In Railway, create a project from this GitHub repository and deploy a service
 using the root [`Dockerfile`](Dockerfile). The [`railway.json`](railway.json)
 file selects Docker and starts the bot with Telegram long polling.
+The service also listens on Railway's `PORT` for a basic health response at
+`/` and `/health`; point an HTTP uptime monitor at the public Railway URL if
+you want external availability checks.
 
 Add these variables in the Railway service's **Variables** settings:
 
@@ -39,9 +42,10 @@ service's environment settings.
 
 Do not add secrets to GitHub, the Docker image, or this README. After deploying,
 check the Railway deployment logs for the bot's polling startup message.
-Railway runs this as a continuously running service; an external ping is not
-needed to prevent idle sleep. The configured failure restart policy handles
-crashes within the limits of your Railway plan.
+The health endpoint confirms the process can serve HTTP but does not confirm
+Telegram or Supabase are reachable, nor does it prevent plan limits from
+stopping the service. The configured failure restart policy handles crashes
+within the limits of your Railway plan.
 
 For Telegram commands, profile management, and monitoring details, see
 [`telegram_video_bot/README.md`](telegram_video_bot/README.md).
