@@ -20,7 +20,7 @@ from aiogram.types import (
 )
 
 from .config import Settings, load_settings
-from .storage import Database
+from .storage import Database, SupabaseError
 from .tiktok import (
     TikTokError,
     Video,
@@ -31,6 +31,7 @@ from .tiktok import (
 
 logger = logging.getLogger("tiktok_monitor")
 TELEGRAM_CAPTION_LIMIT = 1024
+HEARTBEAT_INTERVAL_SECONDS = 300
 
 
 def _utf16_length(value: str) -> int:
@@ -529,6 +530,28 @@ async def monitor_profiles(
         await asyncio.sleep(settings.poll_interval_seconds)
 
 
+async def _monitor_until_cancelled(
+    bot: Bot,
+    database: Database,
+    settings: Settings,
+) -> None:
+    while True:
+        try:
+            await monitor_profiles(bot, database, settings)
+            logger.warning("Profile monitor stopped; restarting in 30 seconds")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Profile monitor stopped unexpectedly; restarting in 30 seconds")
+        await asyncio.sleep(30)
+
+
+async def _log_heartbeat() -> None:
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        logger.info("Heartbeat: Telegram bot process is running")
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -539,7 +562,21 @@ async def main() -> None:
         settings.supabase_url,
         settings.supabase_service_role_key,
     )
-    await database.initialize()
+    retry_delay = 5
+    while True:
+        try:
+            await database.initialize()
+            break
+        except SupabaseError as exc:
+            if not exc.retryable:
+                raise
+            logger.warning(
+                "Supabase is temporarily unavailable; retrying in %s seconds: %s",
+                retry_delay,
+                exc,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 300)
 
     bot = Bot(token=settings.bot_token)
     dispatcher = Dispatcher()
@@ -548,12 +585,17 @@ async def main() -> None:
     dispatcher.include_router(router)
 
     monitor_task: asyncio.Task | None = None
+    heartbeat_task: asyncio.Task | None = None
 
     async def start_monitor(bot: Bot) -> None:
-        nonlocal monitor_task
+        nonlocal monitor_task, heartbeat_task
         monitor_task = asyncio.create_task(
-            monitor_profiles(bot, database, settings),
+            _monitor_until_cancelled(bot, database, settings),
             name="tiktok-profile-monitor",
+        )
+        heartbeat_task = asyncio.create_task(
+            _log_heartbeat(),
+            name="bot-heartbeat",
         )
         logger.info(
             "Monitoring started; checking every %s seconds",
@@ -566,6 +608,12 @@ async def main() -> None:
             monitor_task.cancel()
             try:
                 await monitor_task
+            except asyncio.CancelledError:
+                pass
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
             except asyncio.CancelledError:
                 pass
 

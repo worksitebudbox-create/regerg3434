@@ -15,7 +15,6 @@ __pycache__/
 *.py[cod]
 .env
 .env.*
-!.env.example
 telegram_video_bot/data/
 
 # IDEs and editors

@@ -4,12 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import urlparse
-
-from dotenv import load_dotenv
-
-PROJECT_DIR = Path(__file__).resolve().parent
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,9 +26,7 @@ def _read_int(name: str, default: int) -> int:
 
 
 def load_settings() -> Settings:
-    """Читає .env поруч із цим файлом і перевіряє обов'язкові значення."""
-    load_dotenv(PROJECT_DIR / ".env")
-
+    """Читає лише змінні середовища процесу та перевіряє обов'язкові значення."""
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     raw_admin_ids = os.getenv("ADMIN_IDS", "").strip()
     supabase_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
@@ -53,7 +46,8 @@ def load_settings() -> Settings:
         raise ValueError(
             "Не задано обов'язкові параметри: "
             + ", ".join(missing)
-            + ". Заповніть telegram_video_bot/.env за зразком .env.example."
+            + ". Додайте їх у Variables цього Railway-сервісу "
+            "або задайте в середовищі процесу."
         )
 
     parsed_url = urlparse(supabase_url)

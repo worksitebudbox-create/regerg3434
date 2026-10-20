@@ -14,6 +14,10 @@ from urllib.request import Request, urlopen
 class SupabaseError(RuntimeError):
     """Помилка запиту до Supabase."""
 
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
 
 class Database:
     def __init__(self, url: str, service_role_key: str) -> None:
@@ -63,11 +67,13 @@ class Database:
         except HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace").strip()
             raise SupabaseError(
-                f"Supabase API повернув HTTP {exc.code}: {details or exc.reason}"
+                f"Supabase API повернув HTTP {exc.code}: {details or exc.reason}",
+                retryable=exc.code == 408 or exc.code == 429 or exc.code >= 500,
             ) from exc
         except URLError as exc:
             raise SupabaseError(
-                f"Не вдалося підключитися до Supabase: {exc.reason}"
+                f"Не вдалося підключитися до Supabase: {exc.reason}",
+                retryable=True,
             ) from exc
 
         if not response_body:
