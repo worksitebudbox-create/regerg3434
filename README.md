@@ -23,13 +23,14 @@ and video history is stored in Supabase.
 The bot uses Telegram long polling and checks tracked profiles every 15 minutes
 by default. Admins must send `/start` before the bot can message them.
 
-## Deploy the worker to Render
+## Deploy the bot to Railway
 
-In the Render Dashboard, create a **Blueprint** from this GitHub repository.
-The root [`render.yaml`](render.yaml) configures a **Background Worker** using
-the [`Dockerfile`](Dockerfile); it does not expose a web service.
+In Railway, create a project from this GitHub repository and deploy a service
+using the root [`Dockerfile`](Dockerfile). The
+[`railway.json`](railway.json) file selects Docker and starts the bot with
+Telegram long polling.
 
-Render prompts for these secret values when creating the Blueprint:
+Add these variables in the Railway service's **Variables** settings:
 
 - `BOT_TOKEN`
 - `ADMIN_IDS`
@@ -37,12 +38,12 @@ Render prompts for these secret values when creating the Blueprint:
 - `SUPABASE_SERVICE_ROLE_KEY`
 
 Optional: configure `POLL_INTERVAL_SECONDS` and `MAX_VIDEOS_PER_PROFILE` in the
-worker's environment settings.
+service's environment settings.
 
 Do not add secrets to GitHub, the Docker image, or this README. After deploying,
-check the Render worker logs for the bot's polling startup message. Review the
-compute plan and pricing in the dashboard before creating the continuously
-running worker.
+check the Railway deployment logs for the bot's polling startup message.
+Review your Railway plan and usage balance: this is a continuously running
+service, and trial credits are limited.
 
 For Telegram commands, profile management, and monitoring details, see
 [`telegram_video_bot/README.md`](telegram_video_bot/README.md).
