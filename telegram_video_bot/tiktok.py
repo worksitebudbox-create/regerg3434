@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import yt_dlp
@@ -37,8 +38,13 @@ _TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "m.tiktok.com"}
 
 
 def normalize_profile_url(raw_url: str) -> str:
-    """Перевіряє URL профілю та повертає канонічне посилання TikTok."""
-    parsed = urlsplit(raw_url.strip())
+    """Перевіряє URL або @handle профілю й повертає канонічне посилання."""
+    value = raw_url.strip()
+    handle = value.removeprefix("@")
+    if re.fullmatch(r"[A-Za-z0-9._-]+", handle):
+        return f"https://www.tiktok.com/@{handle}"
+
+    parsed = urlsplit(value)
     host = (parsed.hostname or "").lower()
 
     if parsed.scheme not in {"http", "https"} or host not in _TIKTOK_HOSTS:
@@ -201,3 +207,64 @@ def fetch_video_details(video_url: str, fallback_handle: str = "") -> Video:
     if video is None:
         raise TikTokError(f"У відео TikTok {match.group(2)} немає коректного ID.")
     return video
+
+
+def download_tiktok_video(
+    video_url: str,
+    output_dir: Path,
+    max_bytes: int,
+) -> Path:
+    """Download one public TikTok video to a bounded temporary directory."""
+    parsed = urlsplit(video_url)
+    host = (parsed.hostname or "").lower()
+    match = _VIDEO_PATH.fullmatch(parsed.path)
+    if host not in _TIKTOK_HOSTS or not match:
+        raise TikTokError("Неприпустиме посилання на відео TikTok.")
+
+    canonical_url = (
+        f"https://www.tiktok.com/@{match.group(1)}/video/{match.group(2)}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "extractor_retries": 2,
+        "format": "best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+        "max_filesize": max_bytes,
+        "outtmpl": str(output_dir / "video.%(ext)s"),
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(canonical_url, download=True)
+            if not info:
+                raise TikTokError("TikTok не повернув відеофайл.")
+            candidate = Path(
+                str(info.get("filepath") or ydl.prepare_filename(info))
+            )
+            if not candidate.is_file():
+                candidate = candidate.with_suffix(".mp4")
+            if not candidate.is_file():
+                files = list(output_dir.glob("video.*"))
+                candidate = next(
+                    (
+                        path
+                        for path in files
+                        if path.suffix.lower() in {".mp4", ".m4v", ".mov", ".webm"}
+                    ),
+                    Path(),
+                )
+    except TikTokError:
+        raise
+    except Exception as exc:
+        raise TikTokError(f"Не вдалося завантажити відео TikTok: {exc}") from exc
+
+    if not candidate.is_file():
+        raise TikTokError("TikTok не створив відеофайл.")
+    if candidate.stat().st_size > max_bytes:
+        candidate.unlink(missing_ok=True)
+        raise TikTokError("Відео завелике для надсилання через Telegram.")
+    return candidate
