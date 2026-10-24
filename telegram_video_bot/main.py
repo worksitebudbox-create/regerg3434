@@ -3,28 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import os
 import re
 import tempfile
-from collections.abc import Iterable
 from html import escape
 from pathlib import Path
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    CallbackQuery,
-    BufferedInputFile,
     FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from .config import Settings, load_settings
@@ -32,8 +28,8 @@ from .media_processing import (
     MAX_INPUT_BYTES,
     MAX_OUTPUT_BYTES,
     MediaProcessingError,
-    enhance_image,
     enhance_video,
+    normalize_video,
 )
 from .storage import Database, SupabaseError
 from .tiktok import (
@@ -47,8 +43,16 @@ from .tiktok import (
 
 logger = logging.getLogger("tiktok_monitor")
 TELEGRAM_CAPTION_LIMIT = 1024
-TELEGRAM_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024
 HEARTBEAT_INTERVAL_SECONDS = 300
+BUTTON_ADD_PROFILE = "➕ Додати профіль"
+BUTTON_PROFILES = "📋 Мої профілі"
+BUTTON_SAVE_VIDEO = "⬇️ Скачать видео по ссылке"
+BUTTON_REMOVE_PROFILE = "🗑 Видалити профіль"
+BUTTON_CHAT_ID = "🆔 Мій chat ID"
+BUTTON_HELP = "ℹ️ Довідка"
+BUTTON_MAIN_MENU = "🏠 Головне меню"
+BUTTON_CANCEL = "❌ Скасувати"
+BUTTON_CONFIRM_DELETE = "✅ Так, видалити"
 
 
 async def _health_check(request: web.Request) -> web.Response:
@@ -145,115 +149,98 @@ async def _require_admin(message: Message, settings: Settings) -> bool:
     return False
 
 
-def _format_profile(profile: dict) -> str:
-    return (
-        f"#{profile['id']} · {profile['display_name']}\n"
-        f"{profile['url']}"
-    )
-
-
-def _split_messages(lines: Iterable[str], limit: int = 3800) -> list[str]:
-    messages: list[str] = []
-    current = ""
-    for line in lines:
-        if current and len(current) + len(line) + 1 > limit:
-            messages.append(current)
-            current = ""
-        current = f"{current}\n{line}" if current else line
-    if current:
-        messages.append(current)
-    return messages
-
-
-def _menu_keyboard(section: str, is_admin: bool) -> InlineKeyboardMarkup:
-    if section == "home":
-        rows = []
-        if is_admin:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="➕ Додати профіль",
-                        callback_data="menu:add",
-                    ),
-                    InlineKeyboardButton(
-                        text="📋 Мої профілі",
-                        callback_data="menu:profiles",
-                    ),
-                ]
-            )
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="⬇️ Скачать видео по ссылке",
-                        callback_data="menu:save",
-                    )
-                ]
-            )
+def _menu_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
+    rows = []
+    if is_admin:
         rows.extend(
             [
                 [
-                    InlineKeyboardButton(
-                        text="🆔 Мій chat ID",
-                        callback_data="menu:chatid",
-                    ),
-                    InlineKeyboardButton(
-                        text="ℹ️ Довідка",
-                        callback_data="menu:help",
-                    ),
+                    KeyboardButton(text=BUTTON_ADD_PROFILE),
+                    KeyboardButton(text=BUTTON_PROFILES),
                 ],
-            ]
-        )
-    else:
-        rows = []
-        if section == "profiles" and is_admin:
-            rows.append(
                 [
-                    InlineKeyboardButton(
-                        text="➕ Додати профіль",
-                        callback_data="menu:add",
-                    )
-                ]
-            )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="🏠 Головне меню",
-                    callback_data="menu:home",
-                )
-            ]
-        )
-
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _profiles_keyboard(profiles: list[dict]) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=f"🗑 #{profile['id']}",
-                callback_data=f"profile:remove:{profile['id']}",
-            )
-        ]
-        for profile in profiles[:12]
-    ]
-    if profiles:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="➕ Додати профіль",
-                    callback_data="menu:add",
-                )
+                    KeyboardButton(text=BUTTON_SAVE_VIDEO),
+                    KeyboardButton(text=BUTTON_REMOVE_PROFILE),
+                ],
             ]
         )
     rows.append(
         [
-            InlineKeyboardButton(
-                text="🏠 Головне меню",
-                callback_data="menu:home",
-            )
+            KeyboardButton(text=BUTTON_CHAT_ID),
+            KeyboardButton(text=BUTTON_HELP),
         ]
     )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Оберіть дію в меню",
+    )
+
+
+def _workflow_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BUTTON_CANCEL)],
+            [KeyboardButton(text=BUTTON_MAIN_MENU)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Надішліть посилання або нік",
+    )
+
+
+def _profile_selection_keyboard(profiles: list[dict]) -> ReplyKeyboardMarkup:
+    rows = [
+        [
+            KeyboardButton(
+                text=(
+                    f"#{profile['id']} "
+                    f"{_truncate_utf16(str(profile['display_name']), 32)}"
+                )
+            )
+        ]
+        for profile in profiles[:30]
+    ]
+    rows.extend(
+        [
+            [KeyboardButton(text=BUTTON_CANCEL)],
+            [KeyboardButton(text=BUTTON_MAIN_MENU)],
+        ]
+    )
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Оберіть профіль",
+    )
+
+
+def _delete_confirmation_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BUTTON_CONFIRM_DELETE)],
+            [KeyboardButton(text=BUTTON_CANCEL)],
+            [KeyboardButton(text=BUTTON_MAIN_MENU)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def _convert_video_for_telegram(source: Path, destination: Path) -> bool:
+    try:
+        enhance_video(source, destination)
+        return True
+    except MediaProcessingError as filter_error:
+        logger.warning("Video filters failed; converting to MP4 without filters: %s", filter_error)
+        try:
+            normalize_video(source, destination)
+        except MediaProcessingError as conversion_error:
+            raise MediaProcessingError(
+                f"Could not convert video to MP4: {conversion_error}"
+            ) from conversion_error
+        return False
 
 
 def _main_menu_text(is_admin: bool) -> str:
@@ -276,6 +263,10 @@ class SaveVideoStates(StatesGroup):
     waiting_for_url = State()
 
 
+class ProfileDeleteStates(StatesGroup):
+    selecting_profile = State()
+    confirming_delete = State()
+
 def register_handlers(
     router: Router,
     database: Database,
@@ -285,7 +276,7 @@ def register_handlers(
         is_admin = _admin_only(message, settings)
         await message.answer(
             _main_menu_text(is_admin),
-            reply_markup=_menu_keyboard("home", is_admin),
+            reply_markup=_menu_keyboard(is_admin),
             parse_mode="HTML",
         )
 
@@ -319,167 +310,182 @@ def register_handlers(
             [video.storage_record() for video in existing_videos],
         )
         if profile_id is None:
-            await message.answer("Цей профіль уже є у списку.")
+            await message.answer(
+                "Цей профіль уже є у списку.",
+                reply_markup=_menu_keyboard(_admin_only(message, settings)),
+            )
             return True
 
         await message.answer(
             f"✅ Профіль «{channel_name}» додано.\n"
             f"Поточні відео ({len(existing_videos)}) позначені як уже відомі. "
-            "Сповіщення надходитимуть про нові публікації."
+            "Сповіщення надходитимуть про нові публікації.",
+            reply_markup=_menu_keyboard(_admin_only(message, settings)),
         )
         return True
 
     @router.message(CommandStart())
-    async def start_handler(message: Message) -> None:
+    async def start_handler(message: Message, state: FSMContext) -> None:
+        await state.clear()
         await show_main_menu(message)
 
-    @router.message(Command("menu"))
-    async def menu_handler(message: Message) -> None:
-        await show_main_menu(message)
-
-    @router.callback_query(F.data.startswith("menu:"))
-    async def menu_callback_handler(
-        callback: CallbackQuery,
+    @router.message(F.text.in_({BUTTON_CANCEL, BUTTON_MAIN_MENU}))
+    async def cancel_or_open_main_menu(
+        message: Message,
         state: FSMContext,
     ) -> None:
-        if not isinstance(callback.message, Message):
-            await callback.answer("Це меню вже недоступне.", show_alert=True)
+        await state.clear()
+        if message.text == BUTTON_CANCEL:
+            await message.answer(
+                "Дію скасовано.",
+                reply_markup=_menu_keyboard(_admin_only(message, settings)),
+            )
+        else:
+            await show_main_menu(message)
+
+    @router.message(
+        F.text.in_(
+            {
+                BUTTON_ADD_PROFILE,
+                BUTTON_PROFILES,
+                BUTTON_SAVE_VIDEO,
+                BUTTON_REMOVE_PROFILE,
+                BUTTON_CHAT_ID,
+                BUTTON_HELP,
+            }
+        )
+    )
+    async def persistent_menu_handler(
+        message: Message,
+        state: FSMContext,
+    ) -> None:
+        await state.clear()
+        text = message.text
+        is_admin = _admin_only(message, settings)
+        if text in {
+            BUTTON_ADD_PROFILE,
+            BUTTON_PROFILES,
+            BUTTON_SAVE_VIDEO,
+            BUTTON_REMOVE_PROFILE,
+        } and not await _require_admin(message, settings):
             return
 
-        is_admin = callback.from_user.id in settings.admin_ids
-        section = (callback.data or "").removeprefix("menu:")
-        if section != "add":
-            if section != "save":
-                await state.clear()
-        if section == "home":
-            text = _main_menu_text(is_admin)
-        elif section == "cancel_add":
-            text = _main_menu_text(is_admin)
-            section = "home"
-        elif section == "profiles":
-            if not is_admin:
-                await callback.answer(
-                    "Список профілів доступний лише адміністраторам.",
-                    show_alert=True,
-                )
-                return
-
+        if text == BUTTON_ADD_PROFILE:
+            await state.set_state(ProfileAddStates.waiting_for_profile)
+            await message.answer(
+                "Надішліть @нік або посилання на TikTok-профіль.",
+                reply_markup=_workflow_keyboard(),
+            )
+        elif text == BUTTON_SAVE_VIDEO:
+            await state.set_state(SaveVideoStates.waiting_for_url)
+            await message.answer(
+                "Надішліть пряме посилання на публічне відео TikTok.",
+                reply_markup=_workflow_keyboard(),
+            )
+        elif text == BUTTON_PROFILES:
             profiles = await database.list_profiles()
             if profiles:
                 entries = [
-                    f"• <b>#{profile['id']}</b> "
-                    f"<a href=\"{escape(str(profile['url']), quote=True)}\">"
-                    f"{escape(_truncate_utf16(str(profile['display_name']), 80))}"
-                    "</a>"
-                    for profile in profiles[:12]
+                    f"• #{profile['id']} · {escape(str(profile['display_name']))}\n"
+                    f"{escape(str(profile['url']))}"
+                    for profile in profiles[:30]
                 ]
-                text = (
-                    "<b>📋 ВІДСТЕЖУВАНІ ПРОФІЛІ</b>\n\n"
-                    + "\n".join(entries)
-                )
-                if len(profiles) > 12:
-                    text += (
-                        f"\n\n<i>Показано 12 із {len(profiles)}. "
-                        "Видалення та додавання доступні кнопками.</i>"
-                    )
+                text = "<b>📋 ВІДСТЕЖУВАНІ ПРОФІЛІ</b>\n\n" + "\n\n".join(entries)
+                if len(profiles) > 30:
+                    text += f"\n\nПоказано 30 із {len(profiles)} профілів."
             else:
-                text = (
-                    "<b>📋 ВІДСТЕЖУВАНІ ПРОФІЛІ</b>\n\n"
-                    "Поки що профілів немає.\n"
-                    "Додайте перший профіль за кнопкою нижче."
-                )
-        elif section == "add":
-            if not is_admin:
-                await callback.answer(
-                    "Додавати профілі можуть лише адміністратори.",
-                    show_alert=True,
-                )
-                return
-            text = (
-                "<b>➕ ДОДАТИ ПРОФІЛЬ</b>\n\n"
-                "Надішліть у чат посилання на профіль або його @нік.\n\n"
-                "Наприклад: <code>@username</code>\n"
-                "Поточні відео не надійдуть повторно; сповіщення будуть "
-                "лише про нові публікації."
+                text = "Поки що профілів немає. Натисніть «➕ Додати профіль»."
+            await message.answer(
+                text,
+                reply_markup=_menu_keyboard(is_admin),
+                parse_mode="HTML",
             )
-            await state.set_state(ProfileAddStates.waiting_for_profile)
-        elif section == "save":
-            if not is_admin:
-                await callback.answer(
-                    "Завантаження відео доступне лише адміністраторам.",
-                    show_alert=True,
+        elif text == BUTTON_REMOVE_PROFILE:
+            profiles = await database.list_profiles()
+            if not profiles:
+                await message.answer(
+                    "Немає профілів для видалення.",
+                    reply_markup=_menu_keyboard(is_admin),
                 )
                 return
-            text = (
-                "<b>⬇️ ЗБЕРЕГТИ ВІДЕО</b>\n\n"
-                "Надішліть у чат пряме посилання на публічне відео TikTok.\n"
-                "Бот завантажить ролик, застосує фільтри та надішле файл."
+            await state.set_state(ProfileDeleteStates.selecting_profile)
+            await message.answer(
+                "Оберіть профіль для видалення:",
+                reply_markup=_profile_selection_keyboard(profiles),
             )
-            await state.set_state(SaveVideoStates.waiting_for_url)
-        elif section == "chatid":
-            text = (
-                "<b>🆔 ДАНІ ЧАТУ</b>\n\n"
-                f"Ваш Telegram ID: <code>{callback.from_user.id}</code>\n"
-                f"ID цього чату: <code>{callback.message.chat.id}</code>"
+        elif text == BUTTON_CHAT_ID:
+            user_id = message.from_user.id if message.from_user else "невідомий"
+            await message.answer(
+                f"Ваш Telegram ID: {user_id}\nID цього чату: {message.chat.id}",
+                reply_markup=_menu_keyboard(is_admin),
             )
-        elif section == "help":
-            text = (
-                "<b>ℹ️ ДОПОМОГА</b>\n\n"
-                "Користуйтеся кнопками головного меню: профілі, додавання, "
-                "видалення, довідка та ID чату.\n\n"
-                "Щоб додати профіль, натисніть «Додати профіль» і надішліть "
-                "його @нік або посилання. Щоб зберегти відео, натисніть кнопку "
-                "під сповіщенням.\n\n"
-                "Завантаження й обробка медіа доступні адміністраторам."
+        elif text == BUTTON_HELP:
+            await message.answer(
+                "ℹ️ <b>ДОПОМОГА</b>\n\n"
+                "Користуйтеся постійною клавіатурою внизу екрана.\n"
+                "Додавання профілю: кнопка «Додати профіль», потім @нік або URL.\n"
+                "Збереження відео: кнопка «Скачать видео по ссылке» або "
+                "просто надішліть посилання TikTok.\n"
+                "Фільтри фото вимкнені; відео надсилається в MP4.",
+                reply_markup=_menu_keyboard(is_admin),
+                parse_mode="HTML",
             )
-        else:
-            await callback.answer("Ця дія меню більше не підтримується.")
-            return
 
-        await callback.message.edit_text(
-            text,
-            reply_markup=(
-                _profiles_keyboard(profiles)
-                if section == "profiles" and is_admin
-                else InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="❌ Скасувати",
-                                callback_data="menu:cancel_add",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                text="🏠 Головне меню",
-                                callback_data="menu:home",
-                            )
-                        ],
-                    ]
-                )
-                if section == "add" and is_admin
-                else InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="❌ Скасувати",
-                                callback_data="menu:cancel_add",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                text="🏠 Головне меню",
-                                callback_data="menu:home",
-                            )
-                        ],
-                    ]
-                )
-                if section == "save" and is_admin
-                else _menu_keyboard(section, is_admin)
-            ),
+    @router.message(ProfileDeleteStates.selecting_profile, F.text)
+    async def profile_delete_selection_handler(
+        message: Message,
+        state: FSMContext,
+    ) -> None:
+        match = re.match(r"^#(\d+)\b", message.text or "")
+        if match is None:
+            await message.answer(
+                "Оберіть профіль кнопкою зі списку або натисніть «❌ Скасувати»."
+            )
+            return
+        profiles = await database.list_profiles()
+        profile_id = int(match.group(1))
+        profile = next(
+            (item for item in profiles if int(item["id"]) == profile_id),
+            None,
+        )
+        if profile is None:
+            await message.answer("Профіль більше не знайдено. Оновіть список кнопкою меню.")
+            await state.clear()
+            return
+        await state.update_data(profile_id=profile_id)
+        await state.set_state(ProfileDeleteStates.confirming_delete)
+        await message.answer(
+            f"Видалити профіль «{escape(str(profile['display_name']))}» "
+            f"(#{profile_id}) разом з історією відео?",
+            reply_markup=_delete_confirmation_keyboard(),
             parse_mode="HTML",
         )
-        await callback.answer()
+
+    @router.message(ProfileDeleteStates.confirming_delete, F.text == BUTTON_CONFIRM_DELETE)
+    async def confirm_profile_delete_handler(
+        message: Message,
+        state: FSMContext,
+    ) -> None:
+        data = await state.get_data()
+        profile_id = data.get("profile_id")
+        if not isinstance(profile_id, int):
+            await state.clear()
+            await message.answer(
+                "Не вдалося визначити профіль. Відкрийте список і спробуйте ще раз.",
+                reply_markup=_menu_keyboard(_admin_only(message, settings)),
+            )
+            return
+        if await database.remove_profile(profile_id):
+            await message.answer(
+                f"Профіль #{profile_id} та його історію видалено.",
+                reply_markup=_menu_keyboard(_admin_only(message, settings)),
+            )
+        else:
+            await message.answer(
+                f"Профіль #{profile_id} уже видалено.",
+                reply_markup=_menu_keyboard(_admin_only(message, settings)),
+            )
+        await state.clear()
 
     @router.message(ProfileAddStates.waiting_for_profile, F.text)
     async def add_profile_text_handler(message: Message, state: FSMContext) -> None:
@@ -507,104 +513,26 @@ def register_handlers(
             return
         await send_saved_video(message, video_url)
 
-    @router.callback_query(F.data.startswith("profile:remove:"))
-    async def remove_profile_callback(callback: CallbackQuery) -> None:
-        if not isinstance(callback.message, Message):
-            await callback.answer("Це меню вже недоступне.", show_alert=True)
-            return
-        if callback.from_user.id not in settings.admin_ids:
-            await callback.answer(
-                "Видаляти профілі можуть лише адміністратори.",
-                show_alert=True,
-            )
-            return
-        raw_id = (callback.data or "").removeprefix("profile:remove:")
-        if not raw_id.isdigit():
-            await callback.answer("Некоректний ID профілю.", show_alert=True)
-            return
-        profile_id = int(raw_id)
-        if not await database.remove_profile(profile_id):
-            await callback.answer("Профіль не знайдено.", show_alert=True)
-            return
-
-        profiles = await database.list_profiles()
-        entries = [
-            f"• <b>#{profile['id']}</b> "
-            f"<a href=\"{escape(str(profile['url']), quote=True)}\">"
-            f"{escape(_truncate_utf16(str(profile['display_name']), 80))}</a>"
-            for profile in profiles[:12]
-        ]
-        text = "<b>📋 ВІДСТЕЖУВАНІ ПРОФІЛІ</b>\n\n"
-        text += "\n".join(entries) if entries else "Поки що профілів немає."
-        await callback.message.edit_text(
-            text,
-            reply_markup=_profiles_keyboard(profiles),
-            parse_mode="HTML",
-        )
-        await callback.answer(f"Профіль #{profile_id} видалено.")
-
-    @router.message(Command("chatid"))
-    async def chat_id_handler(message: Message) -> None:
-        user_id = message.from_user.id if message.from_user else "невідомий"
-        await message.answer(
-            f"Ваш user ID: {user_id}\n"
-            f"ID цього чату: {message.chat.id}"
-        )
-
-    async def process_uploaded_photo(message: Message) -> None:
-        if not await _require_admin(message, settings):
-            return
-        if not message.photo:
-            await message.answer("Надішліть фото як зображення.")
-            return
-
-        photo = message.photo[-1]
-        if photo.file_size is not None and photo.file_size > MAX_INPUT_BYTES:
-            await message.answer("Фото завелике. Максимальний розмір — 20 МБ.")
-            return
-
-        image_data = io.BytesIO()
-        try:
-            await message.bot.download(photo, destination=image_data)
-        except TelegramAPIError as exc:
-            logger.warning("Could not download photo from Telegram: %s", exc)
-            await message.answer("Не вдалося отримати фото з Telegram. Спробуйте ще раз.")
-            return
-        if image_data.tell() > MAX_INPUT_BYTES:
-            await message.answer("Фото завелике. Максимальний розмір — 20 МБ.")
-            return
-
-        try:
-            enhanced = await asyncio.to_thread(enhance_image, image_data.getvalue())
-        except MediaProcessingError as exc:
-            logger.warning("Photo enhancement failed for chat %s: %s", message.chat.id, exc)
-            await message.answer("Не вдалося обробити фото. Спробуйте інше зображення.")
-            return
-
-        caption = "Готово: фото оброблено без AI та без збільшення роздільності."
-        photo_file = BufferedInputFile(enhanced, filename="enhanced.jpg")
-        if len(enhanced) <= TELEGRAM_PHOTO_LIMIT_BYTES:
-            await message.answer_photo(photo_file, caption=caption)
-        else:
-            await message.answer_document(photo_file, caption=caption)
-
-    @router.message(F.photo)
-    async def photo_message_handler(message: Message) -> None:
-        await process_uploaded_photo(message)
-
     @router.message(F.video | (F.document & F.document.mime_type.startswith("video/")))
-    async def video_message_handler(message: Message) -> None:
+    async def video_message_handler(message: Message, state: FSMContext) -> None:
         if not await _require_admin(message, settings):
             return
+        await state.clear()
 
         media = message.video or message.document
         if media is None:
             return
         if media.file_size is not None and media.file_size > MAX_INPUT_BYTES:
-            await message.answer("Відео завелике. Максимальний розмір — 20 МБ.")
+            await message.answer(
+                "Відео завелике. Максимальний розмір — 20 МБ.",
+                reply_markup=_menu_keyboard(True),
+            )
             return
 
-        await message.answer("Обробляю відео фільтрами; це може зайняти кілька хвилин…")
+        await message.answer(
+            "Перетворюю відео у сумісний MP4…",
+            reply_markup=_menu_keyboard(True),
+        )
         with tempfile.TemporaryDirectory(prefix="tiktok-upload-") as temp_dir:
             source = Path(temp_dir) / "input"
             try:
@@ -612,30 +540,49 @@ def register_handlers(
             except TelegramAPIError as exc:
                 logger.warning("Could not download video from Telegram: %s", exc)
                 await message.answer(
-                    "Не вдалося отримати відео з Telegram. Спробуйте інший файл."
+                    "Не вдалося отримати відео з Telegram. Спробуйте інший файл.",
+                    reply_markup=_menu_keyboard(True),
                 )
                 return
             if source.stat().st_size > MAX_INPUT_BYTES:
-                await message.answer("Відео завелике. Максимальний розмір — 20 МБ.")
+                await message.answer(
+                    "Відео завелике. Максимальний розмір — 20 МБ.",
+                    reply_markup=_menu_keyboard(True),
+                )
                 return
             output = Path(temp_dir) / "enhanced.mp4"
             try:
-                await asyncio.to_thread(enhance_video, source, output)
+                filters_applied = await asyncio.to_thread(
+                    _convert_video_for_telegram,
+                    source,
+                    output,
+                )
             except MediaProcessingError as exc:
-                logger.warning("Uploaded video enhancement failed: %s", exc)
+                logger.warning("Uploaded video conversion failed: %s", exc)
                 await message.answer(
-                    "Не вдалося обробити відео. Перевірте формат і спробуйте коротший ролик."
+                    "Не вдалося перетворити відео у MP4. Перевірте файл і спробуйте "
+                    "коротший ролик.",
+                    reply_markup=_menu_keyboard(True),
                 )
                 return
             if output.stat().st_size > MAX_OUTPUT_BYTES:
                 await message.answer(
                     "Після обробки відео перевищило ліміт Telegram (45 МБ). "
-                    "Надішліть коротший ролик."
+                    "Надішліть коротший ролик.",
+                    reply_markup=_menu_keyboard(True),
                 )
                 return
             await message.answer_video(
                 FSInputFile(output, filename="enhanced.mp4"),
-                caption="Готово: зниження шуму та легке підвищення різкості (без AI/4K).",
+                caption=(
+                    "Готово: MP4 (H.264/AAC). "
+                    + (
+                        "Застосовано легкі фільтри; без AI/4K."
+                        if filters_applied
+                        else "Надіслано без фільтрів; MP4 для сумісності."
+                    )
+                ),
+                reply_markup=_menu_keyboard(True),
             )
 
     async def send_saved_video(
@@ -650,7 +597,10 @@ def register_handlers(
             await message.answer("Завантаження доступне лише адміністраторам.")
             return
 
-        await message.answer("Завантажую відео TikTok…")
+        await message.answer(
+            "Завантажую відео TikTok…",
+            reply_markup=_menu_keyboard(True),
+        )
         with tempfile.TemporaryDirectory(prefix="tiktok-save-") as temp_dir:
             try:
                 source = await asyncio.to_thread(
@@ -669,101 +619,32 @@ def register_handlers(
 
             output = Path(temp_dir) / "enhanced.mp4"
             try:
-                await asyncio.to_thread(enhance_video, source, output)
+                filters_applied = await asyncio.to_thread(
+                    _convert_video_for_telegram,
+                    source,
+                    output,
+                )
                 if output.stat().st_size > MAX_OUTPUT_BYTES:
                     raise MediaProcessingError("Оброблений файл перевищив ліміт.")
             except MediaProcessingError as exc:
-                logger.warning(
-                    "Could not enhance downloaded TikTok video; sending original: %s",
-                    exc,
-                )
+                logger.exception("Could not convert downloaded TikTok video to MP4: %s", exc)
                 await message.answer(
-                    "Не вдалося застосувати фільтри — надсилаю оригінал без змін."
+                    "Не вдалося перетворити відео у сумісний MP4. Оригінал не "
+                    "надсилаю, щоб уникнути проблем із форматом.",
+                    reply_markup=_menu_keyboard(True),
                 )
-                output = source
+                return
 
-            file = FSInputFile(output, filename=output.name)
-            caption = "Відео готове до збереження в Telegram."
-            if output.suffix.lower() in {".mp4", ".m4v"}:
-                await message.answer_video(file, caption=caption)
-            else:
-                await message.answer_document(file, caption=caption)
-
-    @router.callback_query(F.data.startswith("save:"))
-    async def save_video_callback(callback: CallbackQuery) -> None:
-        if not isinstance(callback.message, Message):
-            await callback.answer("Це повідомлення вже недоступне.", show_alert=True)
-            return
-        if callback.from_user.id not in settings.admin_ids:
-            await callback.answer(
-                "Завантаження доступне лише адміністраторам.",
-                show_alert=True,
+            caption = (
+                "Видео готово для сохранения: MP4 (H.264/AAC)."
+                if filters_applied
+                else "Видео преобразовано в совместимый MP4; фильтры не применялись."
             )
-            return
-        video_id = (callback.data or "").removeprefix("save:")
-        if not re.fullmatch(r"\d+", video_id):
-            await callback.answer("Некоректний ID відео.", show_alert=True)
-            return
-        video_match = re.search(
-            r"/@([A-Za-z0-9._-]+)/video/" + re.escape(video_id) + r"/?$",
-            callback.message.text or callback.message.caption or "",
-        )
-        video_handle = video_match.group(1) if video_match else "_"
-        await callback.answer("Завантажую відео…")
-        await send_saved_video(
-            callback.message,
-            f"https://www.tiktok.com/@{video_handle}/video/{video_id}",
-            requester_id=callback.from_user.id,
-        )
-
-    @router.message(Command("profiles"))
-    async def profiles_handler(message: Message) -> None:
-        if not await _require_admin(message, settings):
-            return
-        profiles = await database.list_profiles()
-        if not profiles:
-            await message.answer(
-                "Поки немає профілів. Додайте профіль командою "
-                "/add_profile <URL профілю>."
+            await message.answer_video(
+                FSInputFile(output, filename="tiktok-video.mp4"),
+                caption=caption,
+                reply_markup=_menu_keyboard(True),
             )
-            return
-        for chunk in _split_messages(
-            [_format_profile(profile) for profile in profiles]
-        ):
-            await message.answer(chunk)
-
-    @router.message(Command("add_profile"))
-    async def add_profile_handler(
-        message: Message, command: CommandObject
-    ) -> None:
-        raw_url = (command.args or "").strip()
-        if not raw_url:
-            await message.answer("Натисніть «➕ Додати профіль» у меню.")
-            return
-        await add_profile_from_input(message, raw_url)
-
-    @router.message(Command("remove_profile"))
-    async def remove_profile_handler(
-        message: Message, command: CommandObject
-    ) -> None:
-        if not await _require_admin(message, settings):
-            return
-        raw_id = (command.args or "").strip()
-        try:
-            profile_id = int(raw_id)
-        except ValueError:
-            await message.answer(
-                "Вкажіть числовий ID зі списку:\n/remove_profile 1"
-            )
-            return
-
-        if await database.remove_profile(profile_id):
-            await message.answer(
-                f"Профіль #{profile_id} і його історію відео видалено."
-            )
-        else:
-            await message.answer(f"Профіль #{profile_id} не знайдено.")
-
 
 async def send_video_notification(
     bot: Bot,
@@ -772,16 +653,6 @@ async def send_video_notification(
     profile_name: str,
 ) -> None:
     caption = build_caption(video, profile_name)
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬇️ Зберегти відео",
-                    callback_data=f"save:{video.video_id}",
-                )
-            ]
-        ]
-    )
 
     async def send_to_admin(chat_id: int) -> None:
         if video.thumbnail:
@@ -790,7 +661,6 @@ async def send_video_notification(
                     chat_id=chat_id,
                     photo=video.thumbnail,
                     caption=caption,
-                    reply_markup=keyboard,
                 )
                 return
             except TelegramAPIError as exc:
@@ -802,11 +672,7 @@ async def send_video_notification(
                     exc,
                 )
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            reply_markup=keyboard,
-        )
+        await bot.send_message(chat_id=chat_id, text=caption)
 
     results = await asyncio.gather(
         *(send_to_admin(chat_id) for chat_id in sorted(settings.admin_ids)),

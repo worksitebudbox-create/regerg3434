@@ -1,13 +1,9 @@
-"""Free, non-AI filters for photos and videos."""
+"""Video filters and MP4 normalization using FFmpeg."""
 
 from __future__ import annotations
 
-import io
 import subprocess
-import warnings
 from pathlib import Path
-
-from PIL import Image, ImageEnhance, ImageOps, UnidentifiedImageError
 
 MAX_INPUT_BYTES = 20 * 1024 * 1024
 MAX_OUTPUT_BYTES = 45 * 1024 * 1024
@@ -18,36 +14,18 @@ class MediaProcessingError(RuntimeError):
     """A media file could not be processed within the bot's limits."""
 
 
-def enhance_image(source: bytes) -> bytes:
-    """Apply mild color, contrast, and sharpening adjustments without upscaling."""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(source)) as image:
-                image = ImageOps.exif_transpose(image)
-                image = ImageEnhance.Color(image).enhance(1.08)
-                image = ImageEnhance.Contrast(image).enhance(1.05)
-                image = ImageEnhance.Sharpness(image).enhance(1.15)
-                if image.mode not in {"RGB", "L"}:
-                    image = image.convert("RGB")
-                if image.mode == "L":
-                    image = image.convert("RGB")
-
-                output = io.BytesIO()
-                image.save(output, format="JPEG", quality=94, optimize=True)
-                return output.getvalue()
-    except (
-        UnidentifiedImageError,
-        OSError,
-        ValueError,
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-    ) as exc:
-        raise MediaProcessingError("Unsupported or invalid image.") from exc
-
-
 def enhance_video(source: Path, destination: Path) -> None:
-    """Denoise and lightly sharpen a video while preserving its source resolution."""
+    """Apply light filters and encode a video as H.264/AAC MP4."""
+    _convert_video(source, destination, apply_filters=True)
+
+
+def normalize_video(source: Path, destination: Path) -> None:
+    """Transcode a video to compatible H.264/AAC MP4 without visual filters."""
+    _convert_video(source, destination, apply_filters=False)
+
+
+def _convert_video(source: Path, destination: Path, *, apply_filters: bool) -> None:
+    filters = "hqdn3d=1.5:1.5:6:6,unsharp=5:5:0.5:5:5:0.0"
     command = [
         "ffmpeg",
         "-nostdin",
@@ -57,22 +35,20 @@ def enhance_video(source: Path, destination: Path) -> None:
         "-y",
         "-i",
         str(source),
-        "-vf",
-        "hqdn3d=1.5:1.5:6:6,unsharp=5:5:0.5:5:5:0.0",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        "-fs",
-        str(MAX_OUTPUT_BYTES - 1024 * 1024),
+        *(
+            ["-vf", filters]
+            if apply_filters
+            else []
+        ),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-fs", str(MAX_OUTPUT_BYTES - 1024 * 1024),
+        "-f", "mp4",
         str(destination),
     ]
     try:

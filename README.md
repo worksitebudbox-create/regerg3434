@@ -2,8 +2,8 @@
 
 This repository contains a Telegram bot that monitors public TikTok profiles
 and sends administrators previews and links when new videos appear. Admins can
-download public videos to Telegram and apply basic non-AI filters to photos and
-videos. Profile and video history is stored in Supabase.
+download public videos to Telegram and convert them to compatible MP4. Profile
+and video history is stored in Supabase.
 
 ## Run the bot locally
 

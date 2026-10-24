@@ -1,17 +1,21 @@
-import io
+import json
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 from aiogram import Router
-from PIL import Image
+from aiogram.types import ReplyKeyboardMarkup
 
 from .config import Settings
 from .main import (
     _extract_tiktok_video_link,
+    _menu_keyboard,
     build_caption,
     register_handlers,
 )
-from .media_processing import MediaProcessingError, enhance_image
+from .media_processing import MediaProcessingError, normalize_video
 from .storage import Database
 from .tiktok import (
     TikTokError,
@@ -40,20 +44,6 @@ class MediaProcessingTests(unittest.TestCase):
         self.assertIn(video.url, caption)
         self.assertNotIn("#", caption)
         self.assertNotIn("Хештеги", caption)
-
-    def test_image_enhancement_preserves_dimensions(self) -> None:
-        original = Image.new("RGB", (32, 24), color=(120, 80, 40))
-        source = io.BytesIO()
-        original.save(source, format="PNG")
-
-        result = Image.open(io.BytesIO(enhance_image(source.getvalue())))
-
-        self.assertEqual(result.size, original.size)
-        self.assertEqual(result.format, "JPEG")
-
-    def test_image_enhancement_rejects_invalid_input(self) -> None:
-        with self.assertRaises(MediaProcessingError):
-            enhance_image(b"not an image")
 
     def test_tiktok_downloader_rejects_non_tiktok_url(self) -> None:
         with self.assertRaises(TikTokError):
@@ -93,6 +83,71 @@ class MediaProcessingTests(unittest.TestCase):
 
         database = Database("https://example.supabase.co", "key")
         register_handlers(Router(), database, settings)
+
+    def test_menu_is_a_persistent_reply_keyboard(self) -> None:
+        keyboard = _menu_keyboard(is_admin=True)
+
+        self.assertIsInstance(keyboard, ReplyKeyboardMarkup)
+        self.assertTrue(keyboard.is_persistent)
+        self.assertTrue(
+            any(
+                button.text == "⬇️ Скачать видео по ссылке"
+                for row in keyboard.keyboard
+                for button in row
+            )
+        )
+
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"),
+        "FFmpeg tools are not installed",
+    )
+    def test_video_normalization_outputs_h264_mp4(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.webm"
+            output = Path(temp_dir) / "normalized.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=160x120:rate=10",
+                    "-t",
+                    "1",
+                    str(source),
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            normalize_video(source, output)
+            info = json.loads(
+                subprocess.check_output(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=format_name:stream=codec_name,codec_type",
+                        "-of",
+                        "json",
+                        str(output),
+                    ],
+                    text=True,
+                )
+            )
+
+            self.assertTrue(output.is_file())
+            self.assertIn("mp4", info["format"]["format_name"])
+            video_stream = next(
+                stream for stream in info["streams"] if stream["codec_type"] == "video"
+            )
+            self.assertEqual(video_stream["codec_name"], "h264")
 
 
 if __name__ == "__main__":
